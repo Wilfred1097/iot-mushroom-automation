@@ -1,0 +1,1825 @@
+#define BLYNK_TEMPLATE_ID "TMPL6G2G0lhLG"
+#define BLYNK_TEMPLATE_NAME "MUSHROOM DATA VISUALIZATION"
+#define BLYNK_AUTH_TOKEN "Xk-G8rQMeVgXeYKsz4xRak4-c0Xr1zZT"
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <LCD_I2C.h>
+#include <SPIFFS.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <HTTPClient.h>
+
+
+
+// WiFi credentials
+const char* ssid = "Mich 2.4G";
+const char* password = "@Mich123***";
+
+// Days of the week array
+const char* DAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+
+// NTP Client setup
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "asia.pool.ntp.org", 28800); // GMT+8 offset in seconds
+const int NTP_UPDATE_INTERVAL = 60000; // Update NTP every minute
+
+// Web server setup (use port 443 for HTTPS)
+WebServer server(443);
+
+// Store domain and connection info
+const char* CLOUD_DOMAIN = "jhcsc-mushroom.com";
+const int CLOUD_PORT = 443;
+const int RETRY_ATTEMPTS = 3;
+const int RETRY_DELAY = 2000; // 2 seconds
+
+// Improved connection management
+bool cloudConnected = false;
+unsigned long lastCloudSync = 0;
+const unsigned long CLOUD_SYNC_INTERVAL = 30000; // 30 seconds
+
+// Store IP address as string for display
+String ipAddress = "";
+
+// DHT sensor setup
+#define DHTPIN 22
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// Relay pins
+#define RELAY_MISTING 26
+#define RELAY_HUMIDIFIER 5
+#define RELAY_FAN 18
+
+// Button pins
+#define BUTTON1 33
+#define BUTTON2 32
+#define BUTTON3 4
+
+// Custom I2C pins
+#define SDA_PIN 21
+#define SCL_PIN 23
+
+// LCD setup
+LCD_I2C lcd(0x27, 16, 2);
+
+// Variables to track states
+bool mistingState = false;
+bool humidifierState = false;
+bool fanState = false;
+bool automationEnabled = true;  // Start with automation enabled
+bool isConnected = false;  // Blynk connection status
+bool manualOverride = false;     // Track if we're in manual override mode
+
+// Automation thresholds
+const float TEMP_MAX = 30.0;
+const float HUMIDITY_MIN = 80.0;
+
+// Manual override timer
+unsigned long lastOverrideTime = 0;
+const unsigned long overrideDuration = 60000; // 1 minute override
+
+// Timing variables
+unsigned long lastSensorRead = 0;
+unsigned long lastWaterLevelRead = 0;
+unsigned long lastOfflineCheck = 0;
+unsigned long lastScheduleCheck = 0;
+
+// Intervals
+const unsigned long SENSOR_READ_INTERVAL = 2000;  // 2 seconds
+const unsigned long WATER_LEVEL_READ_INTERVAL = 5000;  // 5 seconds
+const unsigned long OFFLINE_CHECK_INTERVAL = 10000;  // 10 seconds
+
+// Pin definitions
+#define TRIG_PIN 12  // Ultrasonic sensor trigger pin
+#define ECHO_PIN 14  // Ultrasonic sensor echo pin
+
+// Global variables
+float waterLevel = 0;  // Variable to store water level
+
+// Global variables for offline mode
+bool offlineMode = false;
+const char* OFFLINE_LOG_FILE = "/offline_logs.txt";
+const char* OFFLINE_DATA_FILE = "/sensor_data.txt";
+
+// Schedule management
+#define MAX_SCHEDULES 10
+struct Schedule {
+    int id;
+    String devices;  // Comma-separated list of devices
+    String startTime;
+    String endTime;
+    String days;
+    String action;
+    bool active;
+};
+
+Schedule schedules[MAX_SCHEDULES];
+int scheduleCount = 0;
+
+// Global variable to track if there's an active schedule
+bool activeScheduleInProgress = false;
+String activeScheduleDevices = "";
+int activeScheduleId = -1;
+
+// Forward declarations
+void resetDevicesToAutomation();
+void executeScheduledAction(const String& devices, bool turnOn);
+bool isTimeInRange(const String& currentTime, const String& startTime, const String& endTime);
+bool hasScheduleJustEnded(const String& currentTime, const String& startTime, const String& endTime);
+bool hasScheduleExpired(const String& currentTime, const String& startTime, const String& endTime);
+int frontendToBackendDay(int frontendDay);
+void automationControl();
+void logToTerminal(const String& message);
+String getFormattedDateTime();
+
+// Function to save logs to SPIFFS
+void saveLogToFile(const String &log) {
+    File file = SPIFFS.open("/logs.txt", FILE_APPEND);
+    if (!file) {
+        Serial.println("Failed to open file for appending");
+        return;
+    }
+    file.println(log);
+    file.close();
+}
+
+// Function to retrieve logs from SPIFFS
+void sendLogsToTerminal() {
+    File file = SPIFFS.open("/logs.txt", FILE_READ);
+    if (!file) {
+        Serial.println("Failed to open file for reading");
+        return;
+    }
+
+    while (file.available()) {
+        String log = file.readStringUntil('\n');
+        Blynk.virtualWrite(V7, log);
+    }
+    file.close();
+}
+
+// Function to log messages to Blynk Terminal and SPIFFS
+void logToTerminal(const String &activity) {
+    String log = getFormattedDateTime() + " - " + activity;
+
+    Blynk.virtualWrite(V7, log); // Send to Blynk
+    saveLogToFile(log);          // Save to file
+    Serial.println(log);         // Print to Serial Monitor
+}
+
+// Function to save sensor data in offline mode
+void saveOfflineData(float temperature, float humidity, float waterLevel) {
+    if (!SPIFFS.exists(OFFLINE_DATA_FILE)) {
+        File dataFile = SPIFFS.open(OFFLINE_DATA_FILE, FILE_WRITE);
+        dataFile.close();
+    }
+    
+    StaticJsonDocument<200> doc;
+    doc["timestamp"] = timeClient.getEpochTime();
+    doc["temperature"] = temperature;
+    doc["humidity"] = humidity;
+    doc["water_level"] = waterLevel;
+    doc["misting_state"] = mistingState;
+    doc["humidifier_state"] = humidifierState;
+    doc["fan_state"] = fanState;
+    
+    File dataFile = SPIFFS.open(OFFLINE_DATA_FILE, FILE_APPEND);
+    if (dataFile) {
+        String jsonString;
+        serializeJson(doc, jsonString);
+        dataFile.println(jsonString);
+        dataFile.close();
+    }
+}
+
+// Function to sync offline data when connection is restored
+void syncOfflineData() {
+    if (!SPIFFS.exists(OFFLINE_DATA_FILE)) return;
+    
+    File dataFile = SPIFFS.open(OFFLINE_DATA_FILE, FILE_READ);
+    if (dataFile) {
+        while (dataFile.available()) {
+            String line = dataFile.readStringUntil('\n');
+            StaticJsonDocument<200> doc;
+            DeserializationError error = deserializeJson(doc, line);
+            
+            if (!error) {
+                // Send data to Blynk if connected
+                if (isConnected) {
+                    Blynk.virtualWrite(V5, doc["temperature"].as<float>());
+                    Blynk.virtualWrite(V6, doc["humidity"].as<float>());
+                    delay(100); // Small delay to prevent overwhelming Blynk
+                }
+            }
+        }
+        dataFile.close();
+        // Clear the file after syncing
+        SPIFFS.remove(OFFLINE_DATA_FILE);
+    }
+}
+
+// Function to check Wi-Fi and Blynk connection
+void checkWiFiAndBlynk() {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!isConnected) {
+            if (Blynk.connect()) {
+                isConnected = true;
+                offlineMode = false;
+                logToTerminal("Connection restored - syncing offline data");
+                syncOfflineData();
+                sendLogsToTerminal(); // Reload logs after reconnection
+            }
+        }
+        if (isConnected) {
+            Blynk.run();
+        }
+    } else {
+        isConnected = false;
+        offlineMode = true;
+    }
+}
+
+// Function to update virtual pins
+void updateVirtualPins() {
+    Blynk.virtualWrite(V1, mistingState);
+    Blynk.virtualWrite(V2, humidifierState);
+    Blynk.virtualWrite(V3, fanState);
+    Blynk.virtualWrite(V4, automationEnabled);
+}
+
+// Function to handle CORS
+void handleCORS() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// Function to handle device states request
+void handleDeviceStates() {
+    if (server.method() == HTTP_OPTIONS) {
+        handleCORS();
+        server.send(200);
+        return;
+    }
+    
+    handleCORS();
+    
+    StaticJsonDocument<512> doc;
+    doc["misting"] = mistingState;
+    doc["humidifier"] = humidifierState;
+    doc["fan"] = fanState;
+    doc["automation_enabled"] = automationEnabled;
+    doc["wifi_enabled"] = WiFi.status() == WL_CONNECTED;
+    doc["active_schedule"] = activeScheduleInProgress;
+    
+    if (activeScheduleInProgress) {
+        doc["active_schedule_devices"] = activeScheduleDevices;
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+// Function to handle sensor data request
+void handleSensorData() {
+    handleCORS();
+    
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    
+    StaticJsonDocument<200> doc;
+    doc["temperature"] = isnan(temperature) ? 0 : temperature;
+    doc["humidity"] = isnan(humidity) ? 0 : humidity;
+    doc["water_level"] = waterLevel;
+    doc["misting_state"] = mistingState;
+    doc["humidifier_state"] = humidifierState;
+    doc["fan_state"] = fanState;
+    doc["timestamp"] = timeClient.getEpochTime();
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+// Function to check and control devices based on sensor readings
+void automationControl() {
+    if (!automationEnabled || activeScheduleInProgress) return;
+    
+    float humidity = dht.readHumidity();
+    float temperature = dht.readTemperature();
+    
+    // Read water level (for display/monitoring only)
+    float duration, distance;
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    duration = pulseIn(ECHO_PIN, HIGH);
+    distance = duration * 0.034 / 2;
+    waterLevel = distance;  // Store for monitoring purposes only
+    
+    if (isnan(humidity) || isnan(temperature)) {
+        String errorMsg = "Sensor reading error in automation control";
+        if (offlineMode) {
+            saveLogToFile(errorMsg);
+        } else {
+            logToTerminal(errorMsg);
+        }
+        return;
+    }
+
+    // Update Blynk with sensor values if online
+    if (isConnected) {
+        Blynk.virtualWrite(V5, temperature);  // Temperature virtual pin
+        Blynk.virtualWrite(V6, humidity);     // Humidity virtual pin
+        Blynk.virtualWrite(V7, waterLevel);   // Water level virtual pin (for monitoring only)
+    }
+    
+    // Temperature control - Fan turns on when temperature > 30°C
+    if (temperature > 30.0 && !fanState) {
+        fanState = true;
+        digitalWrite(RELAY_FAN, fanState);
+        String logMsg = "Fan automatically turned ON - Temperature: " + String(temperature);
+        if (offlineMode) {
+            saveLogToFile(logMsg);
+        } else {
+            logToTerminal(logMsg);
+            if (isConnected) {
+                Blynk.virtualWrite(V3, fanState);
+            }
+        }
+    } else if (temperature <= 29.0 && fanState) {  // Add hysteresis to prevent rapid switching
+        fanState = false;
+        digitalWrite(RELAY_FAN, fanState);
+        String logMsg = "Fan automatically turned OFF - Temperature: " + String(temperature);
+        if (offlineMode) {
+            saveLogToFile(logMsg);
+        } else {
+            logToTerminal(logMsg);
+            if (isConnected) {
+                Blynk.virtualWrite(V3, fanState);
+            }
+        }
+    }
+    
+    // Humidity control - Both misting and humidifier turn on when humidity < 80%
+    if (humidity < 80.0) {
+        // Turn on misting if not already onACC
+        if (!mistingState) {
+            mistingState = true;
+            digitalWrite(RELAY_MISTING, mistingState);
+            String logMsg = "Misting automatically turned ON - Humidity: " + String(humidity);
+            if (offlineMode) {
+                saveLogToFile(logMsg);
+            } else {
+                logToTerminal(logMsg);
+                if (isConnected) {
+                    Blynk.virtualWrite(V1, mistingState);
+                }
+            }
+        }
+        
+        // Turn on humidifier if not already on
+        if (!humidifierState) {
+            humidifierState = true;
+            digitalWrite(RELAY_HUMIDIFIER, humidifierState);
+            String logMsg = "Humidifier automatically turned ON - Humidity: " + String(humidity);
+            if (offlineMode) {
+                saveLogToFile(logMsg);
+            } else {
+                logToTerminal(logMsg);
+                if (isConnected) {
+                    Blynk.virtualWrite(V2, humidifierState);
+                }
+            }
+        }
+    } else if (humidity >= 80.0) {  // Turn off when humidity reaches or exceeds 80%
+        // Turn off misting if on
+        if (mistingState) {
+            mistingState = false;
+            digitalWrite(RELAY_MISTING, mistingState);
+            String logMsg = "Misting automatically turned OFF - Humidity: " + String(humidity);
+            if (offlineMode) {
+                saveLogToFile(logMsg);
+            } else {
+                logToTerminal(logMsg);
+                if (isConnected) {
+                    Blynk.virtualWrite(V1, mistingState);
+                }
+            }
+        }
+        
+        // Turn off humidifier if on
+        if (humidifierState) {
+            humidifierState = false;
+            digitalWrite(RELAY_HUMIDIFIER, humidifierState);
+            String logMsg = "Humidifier automatically turned OFF - Humidity: " + String(humidity);
+            if (offlineMode) {
+                saveLogToFile(logMsg);
+            } else {
+                logToTerminal(logMsg);
+                if (isConnected) {
+                    Blynk.virtualWrite(V2, humidifierState);
+                }
+            }
+        }
+    }
+    
+    // Log all sensor values periodically
+    if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
+        String sensorLog = "Temperature: " + String(temperature) + "°C, Humidity: " + String(humidity) + "%, Water Level: " + String(waterLevel) + "cm";
+        if (offlineMode) {
+            saveLogToFile(sensorLog);
+        } else {
+            logToTerminal(sensorLog);
+        }
+        lastSensorRead = millis();
+    }
+}
+
+// Function to handle automation control
+void handleAutomationControl() {
+    if (server.method() == HTTP_OPTIONS) {
+        handleCORS();
+        server.send(200);
+        return;
+    }
+    
+    handleCORS();
+    
+    if (server.hasArg("plain")) {
+        StaticJsonDocument<200> doc;
+        DeserializationError error = deserializeJson(doc, server.arg("plain"));
+        
+        if (!error) {
+            automationEnabled = doc["state"];
+            manualOverride = !automationEnabled;  // Reset manual override when switching modes
+            
+            String logMessage = String("System switched to ") + 
+                              (automationEnabled ? "AUTOMATIC" : "MANUAL") + " control mode";
+            logToTerminal(logMessage);
+            
+            StaticJsonDocument<200> response;
+            response["success"] = true;
+            response["message"] = logMessage;
+            response["automation_enabled"] = automationEnabled;
+            
+            String responseStr;
+            serializeJson(response, responseStr);
+            server.send(200, "application/json", responseStr);
+            
+            // Update Blynk if connected
+            if (isConnected) {
+                Blynk.virtualWrite(V4, automationEnabled);
+            }
+            return;
+        }
+    }
+    
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+}
+
+// Modified handler for manual control
+void handleMistingControl() {
+    if (server.method() == HTTP_OPTIONS) {
+        handleCORS();
+        server.send(200);
+        return;
+    }
+    
+    handleCORS();
+    
+    if (server.hasArg("plain")) {
+        StaticJsonDocument<200> doc;
+        DeserializationError error = deserializeJson(doc, server.arg("plain"));
+        
+        if (!error) {
+            manualOverride = true;  // Enable manual override when manually controlled
+            bool newState = doc["state"];
+            mistingState = newState;
+            digitalWrite(RELAY_MISTING, mistingState);
+            
+            String logMessage = String("Misting manually turned ") + (mistingState ? "ON" : "OFF");
+            logToTerminal(logMessage);
+            
+            // Immediate Blynk update
+            if (isConnected) {
+                Blynk.virtualWrite(V1, mistingState);
+            }
+            
+            StaticJsonDocument<200> response;
+            response["success"] = true;
+            response["message"] = logMessage;
+            response["state"] = mistingState;
+            response["manual_mode"] = true;
+            
+            String responseStr;
+            serializeJson(response, responseStr);
+            server.send(200, "application/json", responseStr);
+            return;
+        }
+    }
+    
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+}
+
+// Function to handle humidifier control
+void handleHumidifierControl() {
+    if (server.method() == HTTP_OPTIONS) {
+        handleCORS();
+        server.send(200);
+        return;
+    }
+    
+    handleCORS();
+    
+    if (server.hasArg("plain")) {
+        StaticJsonDocument<200> doc;
+        DeserializationError error = deserializeJson(doc, server.arg("plain"));
+        
+        if (!error) {
+            manualOverride = true;  // Enable manual override when manually controlled
+            bool newState = doc["state"];
+            humidifierState = newState;
+            digitalWrite(RELAY_HUMIDIFIER, humidifierState);
+            
+            String logMessage = String("Humidifier manually turned ") + (humidifierState ? "ON" : "OFF");
+            logToTerminal(logMessage);
+            
+            // Immediate Blynk update
+            if (isConnected) {
+                Blynk.virtualWrite(V2, humidifierState);
+            }
+            
+            StaticJsonDocument<200> response;
+            response["success"] = true;
+            response["message"] = logMessage;
+            response["state"] = humidifierState;
+            response["manual_mode"] = true;
+            
+            String responseStr;
+            serializeJson(response, responseStr);
+            server.send(200, "application/json", responseStr);
+            return;
+        }
+    }
+    
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+}
+
+// Function to handle fan control
+void handleFanControl() {
+    if (server.method() == HTTP_OPTIONS) {
+        handleCORS();
+        server.send(200);
+        return;
+    }
+    
+    handleCORS();
+    
+    if (server.hasArg("plain")) {
+        StaticJsonDocument<200> doc;
+        DeserializationError error = deserializeJson(doc, server.arg("plain"));
+        
+        if (!error) {
+            manualOverride = true;  // Enable manual override when manually controlled
+            bool newState = doc["state"];
+            fanState = newState;
+            digitalWrite(RELAY_FAN, fanState);
+            
+            String logMessage = String("Fan manually turned ") + (fanState ? "ON" : "OFF");
+            logToTerminal(logMessage);
+            
+            // Immediate Blynk update
+            if (isConnected) {
+                Blynk.virtualWrite(V3, fanState);
+            }
+            
+            StaticJsonDocument<200> response;
+            response["success"] = true;
+            response["message"] = logMessage;
+            response["state"] = fanState;
+            response["manual_mode"] = true;
+            
+            String responseStr;
+            serializeJson(response, responseStr);
+            server.send(200, "application/json", responseStr);
+            return;
+        }
+    }
+    
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+}
+
+// Blynk handler for automation control
+BLYNK_WRITE(V4) {
+    automationEnabled = param.asInt();
+    manualOverride = !automationEnabled;  // Reset manual override when switching modes
+    String logMessage = String("System switched to ") + 
+                       (automationEnabled ? "AUTOMATIC" : "MANUAL") + 
+                       " control mode via Blynk";
+    logToTerminal(logMessage);
+}
+
+// Blynk handlers for all controls
+BLYNK_WRITE(V1) {
+    manualOverride = true;  // Enable manual override when manually controlled
+    mistingState = param.asInt();
+    digitalWrite(RELAY_MISTING, mistingState);
+    String logMessage = String("Misting manually turned ") + (mistingState ? "ON" : "OFF") + " via Blynk";
+    logToTerminal(logMessage);
+}
+
+BLYNK_WRITE(V2) {
+    manualOverride = true;  // Enable manual override when manually controlled
+    humidifierState = param.asInt();
+    digitalWrite(RELAY_HUMIDIFIER, humidifierState);
+    String logMessage = String("Humidifier manually turned ") + (humidifierState ? "ON" : "OFF") + " via Blynk";
+    logToTerminal(logMessage);
+}
+
+BLYNK_WRITE(V3) {
+    manualOverride = true;  // Enable manual override when manually controlled
+    fanState = param.asInt();
+    digitalWrite(RELAY_FAN, fanState);
+    String logMessage = String("Fan manually turned ") + (fanState ? "ON" : "OFF") + " via Blynk";
+    logToTerminal(logMessage);
+}
+
+// Function to handle button press with debouncing and Blynk update
+void handleButtonPress(int buttonPin, bool &state, int relayPin, int blynkPin, const char* deviceName) {
+    static unsigned long lastDebounceTime = 0;
+    const unsigned long debounceDelay = 200;  // Debounce time in milliseconds
+    
+    if (digitalRead(buttonPin) == LOW) {  // Button is pressed (active LOW with INPUT_PULLUP)
+        if ((millis() - lastDebounceTime) > debounceDelay) {
+            state = !state;  // Toggle the state
+            digitalWrite(relayPin, state);
+            
+            // Set manual override
+            manualOverride = true;
+            lastOverrideTime = millis();
+            
+            // Log the action
+            String logMsg = String(deviceName) + " manually turned " + (state ? "ON" : "OFF");
+            if (offlineMode) {
+                saveLogToFile(logMsg);
+            } else {
+                logToTerminal(logMsg);
+            }
+            
+            // Update Blynk if connected
+            if (isConnected) {
+                Blynk.virtualWrite(blynkPin, state);
+            }
+            
+            lastDebounceTime = millis();
+        }
+    }
+}
+
+// Function to update LCD display
+void updateLCD() {
+    static unsigned long lastDisplayToggle = 0;
+    static bool showFirstScreen = true;
+    
+    if (millis() - lastDisplayToggle >= 5000) {  // Toggle display every 3 seconds
+        showFirstScreen = !showFirstScreen;
+        lastDisplayToggle = millis();
+        lcd.clear();
+    }
+    
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    
+    if (!isnan(temperature) && !isnan(humidity)) {
+        if (showFirstScreen) {
+            // First screen: Temperature and Humidity
+            lcd.setCursor(0, 0);
+            lcd.print("T:");
+            lcd.print(temperature, 1);
+            lcd.print("C H:");
+            lcd.print(humidity, 1);
+            lcd.print("%");
+            
+            // Show WiFi status on second line
+            lcd.setCursor(0, 1);
+            if (WiFi.status() == WL_CONNECTED) {
+                lcd.print("WiFi: Connected");
+            } else {
+                lcd.print("WiFi: Offline");
+            }
+        } else {
+            // Second screen: Device States
+            lcd.setCursor(0, 0);
+            lcd.print("Mist:");
+            lcd.print(mistingState ? "ON " : "OFF");
+            lcd.print(" Fan:");
+            lcd.print(fanState ? "ON" : "OFF");
+            
+            lcd.setCursor(0, 1);
+            lcd.print("Humid:");
+            lcd.print(humidifierState ? "ON" : "OFF");
+        }
+    } else {
+        lcd.setCursor(0, 0);
+        lcd.print("Sensor error!");
+        lcd.setCursor(0, 1);
+        lcd.print("Check DHT11");
+    }
+}
+
+// Function to handle serial commands
+void handleSerialCommands() {
+    if (Serial.available() > 0) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+        
+        if (command == "FAN_ON") {
+            fanState = HIGH;
+            digitalWrite(RELAY_FAN, fanState);
+            logToTerminal("Fan turned ON (Manual)");
+        } else if (command == "FAN_OFF") {
+            fanState = LOW;
+            digitalWrite(RELAY_FAN, fanState);
+            logToTerminal("Fan turned OFF (Manual)");
+        } else if (command == "MISTING_ON") {
+            mistingState = HIGH;
+            digitalWrite(RELAY_MISTING, mistingState);
+            logToTerminal("Misting turned ON (Manual)");
+        } else if (command == "MISTING_OFF") {
+            mistingState = LOW;
+            digitalWrite(RELAY_MISTING, mistingState);
+            logToTerminal("Misting turned OFF (Manual)");
+        }
+    }
+}
+
+// Function to read water level from ultrasonic sensor
+float readWaterLevel() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    
+    long duration = pulseIn(ECHO_PIN, HIGH);
+    // Calculate distance in centimeters
+    float distance = duration * 0.034 / 2;
+    
+    // Convert distance to water level percentage
+    // Assuming sensor is mounted 20cm above the bottom
+    // and container height is 20cm
+    float waterLevelPercent = 100 - ((distance / 20.0) * 100);
+    
+    // Constrain values between 0 and 100
+    waterLevelPercent = constrain(waterLevelPercent, 0, 100);
+    
+    return waterLevelPercent;
+}
+
+void checkWaterLevel() {
+    float level = readWaterLevel();
+    String timeStr = getFormattedDateTime();
+    
+    // Update global water level variable for monitoring only
+    waterLevel = level;
+    
+    // Log water level for monitoring
+    logToTerminal(timeStr + " - Water Level: " + String(level, 1) + "cm");
+    
+    // Update Blynk if connected (monitoring only)
+    if (Blynk.connected()) {
+        Blynk.virtualWrite(V7, level);  // Water level virtual pin
+    }
+}
+
+void checkAndExecuteSchedules() {
+    Serial.println("\n\n=== Checking schedules ===");
+    
+    String currentTime = timeClient.getFormattedTime().substring(0, 5); // Get HH:MM only
+    int currentDay = getCurrentDay();
+    
+    // Reset active schedule flag only if no active schedules are found
+    bool foundActiveSchedule = false;
+    bool schedulesChanged = false;
+    
+    Serial.print("Current time: ");
+    Serial.println(currentTime);
+    Serial.print("Current day: ");
+    Serial.println(DAYS[currentDay]);
+    
+    // First pass: Check for expired schedules and mark them for deletion
+    for (int i = scheduleCount - 1; i >= 0; i--) {
+        // Check if schedule has ended and is no longer active
+        if (hasScheduleExpired(currentTime, schedules[i].startTime, schedules[i].endTime)) {
+            // Remove the schedule
+            Serial.print("Schedule ");
+            Serial.print(schedules[i].id);
+            Serial.println(" has expired - removing");
+            
+            // Shift remaining schedules
+            for (int j = i; j < scheduleCount - 1; j++) {
+                schedules[j] = schedules[j + 1];
+            }
+            scheduleCount--;
+            schedulesChanged = true;
+        }
+    }
+    
+    // Save changes if any schedules were removed
+    if (schedulesChanged) {
+        saveSchedulesToSPIFFS();
+    }
+    
+    // Second pass: Check and execute active schedules
+    for (int i = 0; i < scheduleCount; i++) {
+        Serial.print("Checking schedule ");
+        Serial.print(i);
+        Serial.print(": Devices=");
+        Serial.print(schedules[i].devices);
+        Serial.print(", Time=");
+        Serial.print(schedules[i].startTime);
+        Serial.print("-");
+        Serial.print(schedules[i].endTime);
+        Serial.print(", Days=");
+        Serial.println(schedules[i].days);
+        
+        // Check if schedule is for current day
+        String daysStr = schedules[i].days;
+        bool dayMatches = false;
+        
+        // Split the days string by comma and check each day
+        while (daysStr.length() > 0) {
+            int commaIndex = daysStr.indexOf(',');
+            String dayStr;
+            
+            if (commaIndex == -1) {
+                dayStr = daysStr;
+                daysStr = "";
+            } else {
+                dayStr = daysStr.substring(0, commaIndex);
+                daysStr = daysStr.substring(commaIndex + 1);
+            }
+            
+            dayStr.trim();  // Remove any whitespace
+            int frontendDay = dayStr.toInt();
+            int backendDay = frontendToBackendDay(frontendDay);
+            
+            if (backendDay == currentDay) {
+                dayMatches = true;
+                break;
+            }
+        }
+        
+        if (!dayMatches) {
+            Serial.println("Day doesn't match, skipping");
+            continue;
+        }
+        
+        // Check if current time is within schedule range
+        if (isTimeInRange(currentTime, schedules[i].startTime, schedules[i].endTime)) {
+            Serial.println("Time is within range!");
+            foundActiveSchedule = true;
+            activeScheduleInProgress = true;
+            activeScheduleId = schedules[i].id;
+            activeScheduleDevices = schedules[i].devices;
+            executeScheduledAction(schedules[i].devices, schedules[i].action == "on");
+        }
+        // Check if schedule just ended
+        else if (hasScheduleJustEnded(currentTime, schedules[i].startTime, schedules[i].endTime)) {
+            Serial.println("Schedule just ended, returning to automation mode");
+            String logMsg = "Schedule ended for devices: " + schedules[i].devices + " - returning to automation mode";
+            logToTerminal(logMsg);
+            
+            // Only reset if this was the active schedule
+            if (activeScheduleDevices == schedules[i].devices) {
+                activeScheduleInProgress = false;
+                activeScheduleId = -1;
+                activeScheduleDevices = "";
+                resetDevicesToAutomation();
+            }
+        }
+    }
+    
+    // If no active schedules found, ensure we're in automation mode
+    if (!foundActiveSchedule && activeScheduleInProgress) {
+        activeScheduleInProgress = false;
+        activeScheduleId = -1;
+        activeScheduleDevices = "";
+        resetDevicesToAutomation();
+    }
+}
+
+// Helper function to check if a schedule has expired
+bool hasScheduleExpired(const String& currentTime, const String& startTime, const String& endTime) {
+    // Convert times to minutes for easier comparison
+    int current = (currentTime.substring(0,2).toInt() * 60) + currentTime.substring(3,5).toInt();
+    int start = (startTime.substring(0,2).toInt() * 60) + startTime.substring(3,5).toInt();
+    int end = (endTime.substring(0,2).toInt() * 60) + endTime.substring(3,5).toInt();
+    
+    // Handle schedules that cross midnight
+    if (end < start) {
+        end += 24 * 60;  // Add 24 hours
+        if (current < start) {
+            current += 24 * 60;  // Add 24 hours if we're past midnight
+        }
+    }
+    
+    // A schedule is expired if the current time is past its end time
+    return current > end;
+}
+
+// Function to get formatted date time string
+String getFormattedDateTime() {
+    timeClient.update();
+    unsigned long epochTime = timeClient.getEpochTime();
+    
+    // Get day, month, year
+    time_t rawtime = epochTime;
+    struct tm* ti = localtime(&rawtime);
+    
+    char dateTimeStr[25];
+    sprintf(dateTimeStr, "%04d/%02d/%02d %s",
+            ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+            timeClient.getFormattedTime().c_str());
+    
+    return String(dateTimeStr);
+}
+
+// Function to get current day of week (0 = Sunday, 6 = Saturday)
+int getCurrentDay() {
+    timeClient.update();
+    return timeClient.getDay();
+}
+
+// Helper function to check SPIFFS status
+bool checkSPIFFS() {
+    if (!SPIFFS.begin(false)) {  // Try to mount without formatting
+        Serial.println("SPIFFS not mounted, attempting to mount with formatting...");
+        if (!SPIFFS.begin(true)) {  // Try mounting with formatting
+            Serial.println("ERROR: SPIFFS mount failed even with formatting!");
+            return false;
+        }
+        Serial.println("SPIFFS mounted after formatting");
+    }
+    return true;
+}
+
+bool isInternetAvailable() {
+    // Attempt to connect to a known server to check internet availability
+    WiFiClient client;
+    return client.connect("example.com", 80);
+}
+
+void setup() {
+    // Initialize Serial with proper baud rate
+    Serial.begin(115200);
+    delay(1000);  // Give serial connection time to stabilize
+    
+    Serial.println("\n\n=== Starting Mushroom Control System ===");
+    Serial.println("Initializing components...");
+    
+    // Initialize SPIFFS with proper error handling and retries
+    int spiffsRetries = 3;
+    bool spiffsMounted = false;
+    
+    while (spiffsRetries > 0 && !spiffsMounted) {
+        if (SPIFFS.begin(true)) {  // Format on failure
+            spiffsMounted = true;
+            Serial.println("✓ SPIFFS mounted successfully");
+            
+            // Print SPIFFS info
+            size_t totalBytes = SPIFFS.totalBytes();
+            size_t usedBytes = SPIFFS.usedBytes();
+            Serial.printf("SPIFFS Status - Total: %u bytes, Used: %u bytes, Free: %u bytes\n", 
+                        totalBytes, usedBytes, totalBytes - usedBytes);
+                        
+            // List files in SPIFFS
+            Serial.println("SPIFFS files:");
+            File root = SPIFFS.open("/");
+            File file = root.openNextFile();
+            while(file) {
+                Serial.printf("- %s (%u bytes)\n", file.name(), file.size());
+                file = root.openNextFile();
+            }
+        } else {
+            Serial.printf("SPIFFS mount attempt %d failed, retrying...\n", 4 - spiffsRetries);
+            delay(1000);
+            spiffsRetries--;
+        }
+    }
+    
+    if (!spiffsMounted) {
+        Serial.println("ERROR: Failed to mount SPIFFS after multiple attempts!");
+        // Continue anyway as other functions might work
+    }
+    
+    // Initialize DHT sensor
+    dht.begin();
+    Serial.println("✓ DHT sensor initialized");
+    
+    // Initialize LCD
+    Wire.begin(SDA_PIN, SCL_PIN);
+    lcd.begin();
+    lcd.backlight();
+    lcd.clear();
+    lcd.print("Connecting WiFi..");
+    
+    // Initialize WiFi
+    WiFi.mode(WIFI_STA);  // Set WiFi to station mode
+    WiFi.disconnect();    // Disconnect from any previous connections
+    delay(100);
+    
+    Serial.println("\nConnecting to WiFi...");
+    Serial.print("SSID: ");
+    Serial.println(ssid);
+    
+    // Connect to WiFi
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    const int maxAttempts = 20;  // Maximum connection attempts
+    
+    while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+        delay(500);
+        Serial.print(".");
+        lcd.setCursor(0, 1);
+        lcd.print("Attempt: ");
+        lcd.print(attempts + 1);
+        lcd.print("/");
+        lcd.print(maxAttempts);
+        attempts++;
+        
+        // Every 5 attempts, try reconnecting
+        if (attempts % 5 == 0) {
+            Serial.println("\nRetrying connection...");
+            WiFi.disconnect();
+            delay(1000);
+            WiFi.begin(ssid, password);
+        }
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        // Successfully connected
+        ipAddress = WiFi.localIP().toString();
+        lcd.clear();
+        
+        // Read and display initial sensor values
+        float t = dht.readTemperature();
+        float h = dht.readHumidity();
+        
+        if (!isnan(t) && !isnan(h)) {
+            lcd.setCursor(0, 0);
+            lcd.print("T:");
+            lcd.print(t, 1);
+            lcd.print("C H:");
+            lcd.print(h, 1);
+            lcd.print("%");
+            
+            lcd.setCursor(0, 1);
+            lcd.print("WiFi OK!");
+        }
+        
+        Serial.println("\nConnected to WiFi!");
+        Serial.print("IP address: ");
+        Serial.println(ipAddress);
+        
+        delay(2000); // Show initial reading for 2 seconds
+    } else {
+        // Connection failed
+        Serial.println("\nWiFi Connection Failed!");
+        Serial.println("Please check your credentials and WiFi signal");
+        Serial.print("WiFi Status: ");
+        Serial.println(WiFi.status());
+        
+        // Display error on LCD
+        lcd.clear();
+        lcd.print("WiFi Failed!");
+        lcd.setCursor(0, 1);
+        lcd.print("Check Settings");
+        delay(2000);
+        
+        // Optional: Restart ESP32 after failed connection
+        // ESP.restart();
+    }
+    
+    // Initialize relay pins
+    pinMode(RELAY_MISTING, OUTPUT);
+    pinMode(RELAY_HUMIDIFIER, OUTPUT);
+    pinMode(RELAY_FAN, OUTPUT);
+    digitalWrite(RELAY_MISTING, LOW);
+    digitalWrite(RELAY_HUMIDIFIER, LOW);
+    digitalWrite(RELAY_FAN, LOW);
+    Serial.println("✓ Relay pins initialized");
+    
+    // Initialize button pins
+    pinMode(BUTTON1, INPUT_PULLUP);
+    pinMode(BUTTON2, INPUT_PULLUP);
+    pinMode(BUTTON3, INPUT_PULLUP);
+    Serial.println("✓ Button pins initialized");
+    
+    // Initialize ultrasonic sensor pins
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    
+    // Initialize and start NTP Client
+    timeClient.begin();
+    timeClient.setUpdateInterval(NTP_UPDATE_INTERVAL);
+    timeClient.update();
+    Serial.println("✓ NTP Client initialized");
+    
+    // Display current time
+    Serial.print("Current time: ");
+    Serial.println(getFormattedDateTime());
+    
+    // Initialize web server routes
+    server.enableCORS();
+    server.on("/api/sensor-data", HTTP_GET, handleSensorData);
+    server.on("/api/device-states", HTTP_GET, handleDeviceStates);
+    server.on("/api/control/automation", HTTP_POST, handleAutomationControl);
+    server.on("/api/control/misting", HTTP_POST, handleMistingControl);
+    server.on("/api/control/humidifier", HTTP_POST, handleHumidifierControl);
+    server.on("/api/control/fan", HTTP_POST, handleFanControl);
+    server.on("/api/schedule", HTTP_POST, handleScheduleCreate);
+    server.on("/api/schedule/*", HTTP_DELETE, handleScheduleDelete);
+    
+    // Handle CORS preflight
+    server.on("/api/control/automation", HTTP_OPTIONS, handleCORS);
+    server.on("/api/control/misting", HTTP_OPTIONS, handleCORS);
+    server.on("/api/control/humidifier", HTTP_OPTIONS, handleCORS);
+    server.on("/api/control/fan", HTTP_OPTIONS, handleCORS);
+    
+    server.begin();
+    Serial.println("✓ Web server started");
+    
+    // Connect to Blynk
+    Serial.print("Connecting to Blynk");
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+    int blynkAttempts = 0;
+    while (!Blynk.connected() && blynkAttempts < 20) {
+        delay(500);
+        Serial.print(".");
+        blynkAttempts++;
+    }
+    
+    if (Blynk.connected()) {
+        Serial.println("\n✓ Blynk connected!");
+        isConnected = true;
+    } else {
+        Serial.println("\nERROR: Blynk connection failed!");
+    }
+    
+    Serial.println("\nSystem initialization complete!");
+    Serial.println("===============================");
+}
+void checkAndReconnectWiFi() {
+    static unsigned long lastWiFiCheck = 0;
+    const unsigned long WIFI_CHECK_INTERVAL = 30000;
+    
+    if (millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
+        lastWiFiCheck = millis();
+        
+        if (WiFi.status() != WL_CONNECTED) {
+            WiFi.mode(WIFI_STA);
+            WiFi.disconnect(true);
+            delay(1000);
+            
+            lcd.clear();
+            lcd.print("WiFi Lost!");
+            lcd.setCursor(0, 1);
+            lcd.print("Reconnecting...");
+            
+            Serial.println("WiFi connection lost. Reconnecting...");
+            
+            WiFi.begin(ssid, password);
+            
+            int attempts = 0;
+            while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+                delay(500);
+                Serial.print(".");
+                lcd.setCursor(attempts % 16, 1);
+                lcd.print(".");
+                attempts++;
+                
+                if (attempts % 5 == 0) {
+                    WiFi.disconnect(true);
+                    delay(1000);
+                    WiFi.begin(ssid, password);
+                }
+            }
+            
+            if (WiFi.status() == WL_CONNECTED) {
+                ipAddress = WiFi.localIP().toString();
+                Serial.println("\nReconnected to WiFi!");
+                Serial.print("New IP: ");
+                Serial.println(ipAddress);
+                
+                lcd.clear();
+                lcd.print("WiFi Restored!");
+                delay(1000);
+            } else {
+                Serial.println("\nFailed to reconnect");
+                lcd.clear();
+                lcd.print("WiFi Failed");
+                lcd.setCursor(0, 1);
+                lcd.print("Check Network");
+            }
+        }
+    }
+}
+// Improved cloud communication functions
+bool syncWithCloud() {
+    int attempts = 0;
+    while (attempts < RETRY_ATTEMPTS) {
+        if (sendDataToCloud()) {
+            cloudConnected = true;
+            lastCloudSync = millis();
+            return true;
+        }
+        attempts++;
+        delay(RETRY_DELAY);
+    }
+    cloudConnected = false;
+    return false;
+}
+
+String cloudEndpoint = "https://jhcsc-mushroom.com/api/sensor-readings/";
+
+bool sendDataToCloud() {
+    StaticJsonDocument<200> doc;
+    doc["temperature"] = dht.readTemperature();
+    doc["humidity"] = dht.readHumidity();
+    doc["misting_state"] = mistingState;
+    doc["humidifier_state"] = humidifierState;
+    doc["fan_state"] = fanState;
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    HTTPClient http;
+    http.begin(cloudEndpoint);
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.POST(jsonString);
+    http.end();
+    
+    return httpCode == 200;
+}
+
+void loop() {
+    // Update NTP time
+    timeClient.update();
+    
+    // Check WiFi connection
+    checkAndReconnectWiFi();
+    
+    // Sync with cloud server periodically
+    if (millis() - lastCloudSync >= CLOUD_SYNC_INTERVAL) {
+        syncWithCloud();
+    }
+    
+    // Handle Blynk connection if internet is available
+    bool internetAvailable = isInternetAvailable();
+    if (internetAvailable && Blynk.connected()) {
+        Blynk.run();
+    } else {
+        // Handle offline mode
+        Serial.println("Running in offline mode");
+        automationControl();
+    }
+    
+    // Handle manual control via buttons
+    handleButtonPress(BUTTON1, mistingState, RELAY_MISTING, V1, "Misting");      // Button 1 controls misting
+    handleButtonPress(BUTTON2, humidifierState, RELAY_HUMIDIFIER, V2, "Humidifier"); // Button 2 controls humidifier
+    handleButtonPress(BUTTON3, fanState, RELAY_FAN, V3, "Fan");          // Button 3 controls fan
+    
+    // Check if manual override should be cleared (after 1 minute of no button presses)
+    if (manualOverride && (millis() - lastOverrideTime >= 60000)) {
+        manualOverride = false;
+        String logMsg = "Manual override timeout - returning to automatic mode";
+        if (offlineMode) {
+            saveLogToFile(logMsg);
+        } else {
+            logToTerminal(logMsg);
+        }
+    }
+    
+    // Check schedules at regular intervals
+    if (millis() - lastScheduleCheck >= 60000) {  // Check every minute
+        lastScheduleCheck = millis();
+        checkAndExecuteSchedules();
+    }
+    
+    // Run automation if enabled and not in manual override
+    if (automationEnabled && !manualOverride) {
+        if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
+            lastSensorRead = millis();
+            automationControl();
+        }
+    }
+    
+    // Check water level at regular intervals (monitoring only)
+    if (millis() - lastWaterLevelRead >= WATER_LEVEL_READ_INTERVAL) {
+        lastWaterLevelRead = millis();
+        checkWaterLevel();
+    }
+    
+    // Handle offline mode data syncing
+    if (!offlineMode && millis() - lastOfflineCheck >= OFFLINE_CHECK_INTERVAL) {
+        lastOfflineCheck = millis();
+        syncOfflineData();
+    }
+    
+    // Handle incoming serial commands
+    handleSerialCommands();
+    
+    // Handle web server clients
+    server.handleClient();
+    
+    // Update LCD display
+    updateLCD();
+}
+
+// Schedule management endpoints
+void handleScheduleCreate() {
+    if (server.method() == HTTP_OPTIONS) {
+        handleCORS();
+        server.send(200);
+        return;
+    }
+
+    String json = server.arg("plain");
+    Serial.print("Received schedule data: ");
+    Serial.println(json);
+
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, json);
+
+    if (error) {
+        String errorMsg = "JSON Error: ";
+        errorMsg += error.c_str();
+        Serial.println(errorMsg);
+        server.send(400, "application/json", "{\"error\": \"Invalid JSON\"}");
+        return;
+    }
+
+    if (scheduleCount >= MAX_SCHEDULES) {
+        server.send(400, "application/json", "{\"error\": \"Maximum schedule limit reached\"}");
+        return;
+    }
+
+    Schedule newSchedule;
+    newSchedule.id = doc["id"] | -1;
+    newSchedule.devices = doc["devices"].as<String>();
+    newSchedule.startTime = doc["start_time"].as<String>();
+    newSchedule.endTime = doc["end_time"].as<String>();
+    newSchedule.days = doc["days"].as<String>();
+    newSchedule.action = doc["action"].as<String>();
+    newSchedule.active = true;
+
+    Serial.println("Creating schedule:");
+    Serial.print("ID: "); Serial.println(newSchedule.id);
+    Serial.print("Devices: "); Serial.println(newSchedule.devices);
+    Serial.print("Start Time: "); Serial.println(newSchedule.startTime);
+    Serial.print("End Time: "); Serial.println(newSchedule.endTime);
+    Serial.print("Days: "); Serial.println(newSchedule.days);
+    Serial.print("Action: "); Serial.println(newSchedule.action);
+
+    schedules[scheduleCount++] = newSchedule;
+    saveSchedulesToSPIFFS();
+
+    server.send(200, "application/json", "{\"success\": true}");
+}
+
+void handleScheduleDelete() {
+    if (server.method() == HTTP_OPTIONS) {
+        handleCORS();
+        server.send(200);
+        return;
+    }
+
+    handleCORS();
+
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\": \"No data provided\"}");
+        return;
+    }
+
+    String json = server.arg("plain");
+    Serial.print("Received delete request: ");
+    Serial.println(json);
+
+    DynamicJsonDocument doc(200);
+    DeserializationError error = deserializeJson(doc, json);
+
+    if (error) {
+        String errorMsg = "{\"error\": \"Invalid JSON: ";
+        errorMsg += error.c_str();
+        errorMsg += "\"}";
+        server.send(400, "application/json", errorMsg);
+        return;
+    }
+
+    int id = doc["id"] | -1;
+    if (id == -1) {
+        server.send(400, "application/json", "{\"error\": \"Invalid schedule ID\"}");
+        return;
+    }
+
+    Serial.print("Deleting schedule with ID: ");
+    Serial.println(id);
+    
+    bool found = false;
+    for (int i = 0; i < scheduleCount; i++) {
+        if (schedules[i].id == id) {
+            // If this schedule is active, disable it first
+            if (activeScheduleInProgress && activeScheduleId == id) {
+                activeScheduleInProgress = false;
+                activeScheduleId = -1;
+                resetDevicesToAutomation();
+            }
+            
+            // Shift remaining schedules
+            for (int j = i; j < scheduleCount - 1; j++) {
+                schedules[j] = schedules[j + 1];
+            }
+            scheduleCount--;
+            found = true;
+            break;
+        }
+    }
+
+    if (found) {
+        // Save updated schedules to SPIFFS
+        if (saveSchedulesToSPIFFS()) {
+            String successMsg = "{\"success\": true, \"message\": \"Schedule " + String(id) + " deleted\"}";
+            server.send(200, "application/json", successMsg);
+            Serial.println("Schedule deleted and SPIFFS updated successfully");
+        } else {
+            server.send(500, "application/json", "{\"error\": \"Failed to save changes to SPIFFS\"}");
+            Serial.println("Error: Failed to save changes to SPIFFS");
+        }
+    } else {
+        String errorMsg = "{\"error\": \"Schedule " + String(id) + " not found\"}";
+        server.send(404, "application/json", errorMsg);
+        Serial.println("Schedule not found");
+    }
+}
+
+bool saveSchedulesToSPIFFS() {
+    Serial.println("Saving schedules to SPIFFS...");
+    
+    // Check SPIFFS status
+    if (!checkSPIFFS()) {
+        Serial.println("Error: SPIFFS not available!");
+        return false;
+    }
+    
+    // Get available space
+    size_t totalBytes = SPIFFS.totalBytes();
+    size_t usedBytes = SPIFFS.usedBytes();
+    size_t freeBytes = totalBytes - usedBytes;
+    
+    Serial.printf("SPIFFS Status - Total: %u, Used: %u, Free: %u\n", totalBytes, usedBytes, freeBytes);
+    
+    // Create backup of existing file if it exists
+    if (SPIFFS.exists("/schedules.json")) {
+        if (SPIFFS.exists("/schedules.json.bak")) {
+            SPIFFS.remove("/schedules.json.bak");
+        }
+        File currentFile = SPIFFS.open("/schedules.json", "r");
+        File backupFile = SPIFFS.open("/schedules.json.bak", "w");
+        if (currentFile && backupFile) {
+            while (currentFile.available()) {
+                backupFile.write(currentFile.read());
+            }
+            currentFile.close();
+            backupFile.close();
+        }
+    }
+    
+    // Create JSON document
+    DynamicJsonDocument doc(4096);  // Increased buffer size
+    JsonArray array = doc.to<JsonArray>();
+
+    for (int i = 0; i < scheduleCount; i++) {
+        JsonObject obj = array.createNestedObject();
+        obj["id"] = schedules[i].id;
+        obj["devices"] = schedules[i].devices;
+        obj["start_time"] = schedules[i].startTime;
+        obj["end_time"] = schedules[i].endTime;
+        obj["days"] = schedules[i].days;
+        obj["action"] = schedules[i].action;
+        obj["active"] = schedules[i].active;
+    }
+
+    // Open file for writing
+    File file = SPIFFS.open("/schedules.json", "w");
+    if (!file) {
+        Serial.println("Failed to open schedule file for writing");
+        return false;
+    }
+
+    // Write JSON to file
+    if (serializeJson(doc, file) == 0) {
+        Serial.println("Failed to write JSON to file");
+        file.close();
+        return false;
+    }
+
+    file.close();
+    Serial.println("Successfully saved schedules to SPIFFS");
+    return true;
+}
+
+void loadSchedulesFromSPIFFS() {
+    Serial.println("Loading schedules from SPIFFS...");
+    
+    scheduleCount = 0;
+    
+    const char* filename = "/schedules.json";
+    
+    // Check SPIFFS status
+    if (!checkSPIFFS()) {
+        Serial.println("Error: SPIFFS not available!");
+        return;
+    }
+    
+    if (!SPIFFS.exists(filename)) {
+        Serial.println("No schedules file found, creating empty one");
+        File file;
+        int retries = 3;
+        while (retries > 0) {
+            file = SPIFFS.open(filename, "w");
+            if (file) break;
+            Serial.println("Failed to create file, retrying...");
+            delay(100);
+            retries--;
+        }
+        
+        if (!file) {
+            Serial.println("Failed to create schedules file after all retries");
+            return;
+        }
+        file.print("[]");
+        file.close();
+        return;
+    }
+
+    // Try to open file with retries
+    File file;
+    int retries = 3;
+    while (retries > 0) {
+        file = SPIFFS.open(filename, "r");
+        if (file) break;
+        Serial.println("Failed to open file, retrying...");
+        delay(100);
+        retries--;
+    }
+    
+    if (!file) {
+        Serial.println("Failed to open schedules file for reading after all retries");
+        return;
+    }
+
+    // Read file content
+    String jsonString = file.readString();
+    file.close();
+    
+    // Check if file is empty or invalid
+    if (jsonString.length() == 0) {
+        Serial.println("Schedule file is empty, initializing with empty array");
+        jsonString = "[]";
+    }
+
+    // Parse JSON with increased buffer
+    DynamicJsonDocument doc(4096);
+    DeserializationError error = deserializeJson(doc, jsonString);
+    
+    if (error) {
+        Serial.print("Failed to parse schedule file: ");
+        Serial.println(error.c_str());
+        // Backup corrupted file
+        if (SPIFFS.exists("/schedules.json.bak")) {
+            SPIFFS.remove("/schedules.json.bak");
+        }
+        SPIFFS.rename("/schedules.json", "/schedules.json.bak");
+        // Create new empty file
+        File newFile = SPIFFS.open("/schedules.json", "w");
+        if (newFile) {
+            newFile.print("[]");
+            newFile.close();
+        }
+        return;
+    }
+
+    JsonArray array = doc.as<JsonArray>();
+    
+    // Load schedules
+    for (JsonObject obj : array) {
+        if (scheduleCount >= MAX_SCHEDULES) {
+            Serial.println("Warning: Maximum number of schedules reached");
+            break;
+        }
+        
+        schedules[scheduleCount].id = obj["id"].as<int>();
+        schedules[scheduleCount].devices = obj["devices"].as<String>();
+        schedules[scheduleCount].startTime = obj["start_time"].as<String>();
+        schedules[scheduleCount].endTime = obj["end_time"].as<String>();
+        schedules[scheduleCount].days = obj["days"].as<String>();
+        schedules[scheduleCount].action = obj["action"].as<String>();
+        schedules[scheduleCount].active = obj["active"] | true;
+        
+        scheduleCount++;
+    }
+    
+    Serial.print("Successfully loaded ");
+    Serial.print(scheduleCount);
+    Serial.println(" schedules");
+}
+
+// Helper function to reset devices to automation control
+void resetDevicesToAutomation() {
+    Serial.println("Resetting all devices to automation control");
+    
+    // Re-enable automation
+    automationEnabled = true;
+    
+    // Reset all device states
+    mistingState = false;
+    humidifierState = false;
+    fanState = false;
+    
+    digitalWrite(RELAY_MISTING, LOW);
+    digitalWrite(RELAY_HUMIDIFIER, LOW);
+    digitalWrite(RELAY_FAN, LOW);
+    
+    // Log the reset
+    String timeStr = getFormattedDateTime();
+    logToTerminal(timeStr + " - All devices reset to automation control");
+    
+    // Update Blynk if connected
+    if (Blynk.connected()) {
+        Blynk.virtualWrite(V4, 0);  // Misting
+        Blynk.virtualWrite(V5, 0);  // Humidifier
+        Blynk.virtualWrite(V6, 0);  // Fan
+    }
+    
+    // Trigger immediate automation check
+    automationControl();
+}
+
+void executeScheduledAction(const String& devices, bool turnOn) {
+    String timeStr = getFormattedDateTime();
+    String action = turnOn ? "ON" : "OFF";
+    
+    Serial.print("Executing scheduled action for devices: ");
+    Serial.print(devices);
+    Serial.print(" -> ");
+    Serial.println(action);
+    
+    // Save previous automation state
+    bool prevAutomation = automationEnabled;
+    automationEnabled = false; // Temporarily disable automation
+    
+    // Split devices string into individual devices
+    String deviceList = devices;
+    while (deviceList.length() > 0) {
+        int commaIndex = deviceList.indexOf(',');
+        String device;
+        
+        if (commaIndex == -1) {
+            device = deviceList;
+            deviceList = "";
+        } else {
+            device = deviceList.substring(0, commaIndex);
+            deviceList = deviceList.substring(commaIndex + 1);
+        }
+        
+        device.trim();  // Remove any whitespace
+        
+        int pin = -1;
+        bool* stateVar = nullptr;
+        
+        if (device == "misting") {
+            pin = RELAY_MISTING;
+            stateVar = &mistingState;
+        }
+        else if (device == "humidifier") {
+            pin = RELAY_HUMIDIFIER;
+            stateVar = &humidifierState;
+        }
+        else if (device == "fan") {
+            pin = RELAY_FAN;
+            stateVar = &fanState;
+        }
+        
+        if (pin != -1 && stateVar != nullptr) {
+            digitalWrite(pin, turnOn ? HIGH : LOW);
+            *stateVar = turnOn;
+            logToTerminal(timeStr + " - " + device + " " + action + " (Scheduled)");
+            
+            // Update Blynk if connected
+            if (Blynk.connected()) {
+                int virtualPin = -1;
+                if (device == "misting") virtualPin = V4;
+                else if (device == "humidifier") virtualPin = V5;
+                else if (device == "fan") virtualPin = V6;
+                
+                if (virtualPin != -1) {
+                    Blynk.virtualWrite(virtualPin, turnOn ? 255 : 0);
+                }
+            }
+        }
+    }
+    
+    // Restore previous automation state
+    automationEnabled = prevAutomation;
+}
+
+// Function to convert frontend day (1-7, Mon-Sun) to backend day (0-6, Sun-Sat)
+int frontendToBackendDay(int frontendDay) {
+    // Frontend: 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat, 0/7=Sun
+    // Backend:  0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+    if (frontendDay == 0 || frontendDay == 7) return 0;  // Sunday
+    return frontendDay % 7;  // Other days just need modulo
+}
+
+bool isTimeInRange(const String& currentTime, const String& startTime, const String& endTime) {
+    // Convert times to minutes for easier comparison
+    int current = (currentTime.substring(0,2).toInt() * 60) + currentTime.substring(3,5).toInt();
+    int start = (startTime.substring(0,2).toInt() * 60) + startTime.substring(3,5).toInt();
+    int end = (endTime.substring(0,2).toInt() * 60) + endTime.substring(3,5).toInt();
+    
+    // Handle overnight schedules (end time is less than start time)
+    if (end < start) {
+        // Add 24 hours to end time
+        end += 24 * 60;
+        // If current time is less than start time, add 24 hours to it too
+        if (current < start) {
+            current += 24 * 60;
+        }
+    }
+    
+    return current >= start && current <= end;
+}
+
+bool hasScheduleJustEnded(const String& currentTime, const String& startTime, const String& endTime) {
+    // Convert times to minutes for easier comparison
+    int current = (currentTime.substring(0,2).toInt() * 60) + currentTime.substring(3,5).toInt();
+    int start = (startTime.substring(0,2).toInt() * 60) + startTime.substring(3,5).toInt();
+    int end = (endTime.substring(0,2).toInt() * 60) + endTime.substring(3,5).toInt();
+    
+    // Handle overnight schedules
+    if (end < start) {
+        end += 24 * 60;
+        if (current < start) {
+            current += 24 * 60;
+        }
+    }
+    
+    // Check if we're just past the end time (within 1 minute)
+    //return current > end && current <= (end + 1);
+}
+
+// Reset devices back to automation control
+void resetDevicesToAutomation(String devices) {
+    Serial.println("Resetting devices to automation control: " + devices);
+    
+    // Parse the devices string
+    if (devices.indexOf("misting") != -1) {
+        mistingState = false;
+        digitalWrite(RELAY_MISTING, mistingState);
+    }
+    if (devices.indexOf("humidifier") != -1) {
+        humidifierState = false;
+        digitalWrite(RELAY_HUMIDIFIER, humidifierState);
+    }
+    if (devices.indexOf("fan") != -1) {
+        fanState = false;
+        digitalWrite(RELAY_FAN, fanState);
+    }
+    
+    // Log the reset
+    String timeStr = getFormattedDateTime();
+    logToTerminal(timeStr + " - Devices reset to automation control");
+    
+    // Update Blynk if connected
+    if (Blynk.connected()) {
+        Blynk.virtualWrite(V4, 0);  // Misting
+        Blynk.virtualWrite(V5, 0);  // Humidifier
+        Blynk.virtualWrite(V6, 0);  // Fan
+    }
+    
+    // Trigger immediate automation check
+    automationControl();
+}
