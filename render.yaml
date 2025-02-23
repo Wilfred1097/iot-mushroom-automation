@@ -1,0 +1,20 @@
+services:
+  - name: my-php-app
+    type: web
+    env: docker
+    plan: free
+    repo: https://github.com/yourusername/yourrepo
+    region: oregon
+    rootDir: /
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DB_HOST
+        value: 153.92.15.53
+      - key: DB_USER
+        value: u605048123_root2025
+      - key: DB_PASS
+        value: #7nL=dw3N7
+      - key: DB_NAME
+        value: u605048123_jhcsc
