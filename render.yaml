@@ -3,7 +3,7 @@ services:
     type: web
     env: docker
     plan: free
-    repo: https://github.com/yourusername/yourrepo
+    repo: https://github.com/Wilfred1097/iot-mushroom-automation
     region: oregon
     rootDir: /
     dockerfilePath: ./Dockerfile

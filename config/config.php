@@ -29,4 +29,4 @@ try {
 } catch (Exception $e) {
     die("Error loading .env file: " . $e->getMessage());
 }
-?> 
+?>
